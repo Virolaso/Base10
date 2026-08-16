@@ -22,6 +22,7 @@ try:
         create_info_router,
         create_jobs_router,
         create_library_router,
+        create_projects_router,
         create_reference_library_router,
     )
 except ImportError:  # pragma: no cover - fallback for direct script execution
@@ -38,6 +39,7 @@ except ImportError:  # pragma: no cover - fallback for direct script execution
         create_info_router,
         create_jobs_router,
         create_library_router,
+        create_projects_router,
         create_reference_library_router,
     )
 try:
@@ -298,14 +300,36 @@ def _make_progress_cb(job_id: str):
 
 def run_mastering_job(job_id: str, input_path: str, params: dict):
     jobs.update_job(job_id, status="processing", started_at=time.time(), progress=0, stage="Iniciando procesamiento")
+    jobs.set_stage(job_id, "analyzing", progress=10)
+    jobs.append_log(job_id, "Preparando análisis del archivo", stage="analyzing")
+    jobs.snapshot_params(job_id, params)
     try:
         cleanup_old()
+        jobs.append_log(job_id, "Procesando mastering con la cadena de audio", stage="rendering")
+        jobs.set_stage(job_id, "rendering", progress=25)
         result = process_audio(input_path, progress_cb=_make_progress_cb(job_id), **params)
+        jobs.set_stage(job_id, "generating_preview", progress=85)
+        jobs.append_log(job_id, "Render finalizado; preparando exportes y preview", stage="generating_preview")
+        output_path = result.get("output_path")
+        output_format = str(params.get("output_format", "wav")).lower()
+        if output_path and os.path.exists(output_path):
+            jobs.add_export(
+                job_id,
+                "master_final",
+                output_path,
+                version_name="master_final",
+                format=output_format,
+                bit_depth=params.get("output_bit_depth", 24),
+                target_lufs=params.get("target_lufs"),
+                platform_target=params.get("platform_target"),
+            )
         jobs.update_job(job_id, status="done", result=result, finished_at=time.time(),
                         progress=100, stage="Completado")
+        jobs.append_log(job_id, f"Master finalizado correctamente: {output_path or 'sin ruta'}", stage="preview_ready")
         logger.info(f"Job {job_id} done: {result['output_path']}")
     except Exception as e:
-        jobs.update_job(job_id, status="error", error=str(e))
+        jobs.mark_failed(job_id, str(e), stage="failed", progress=0)
+        jobs.append_log(job_id, f"Error en el job: {e}", stage="failed", level="error")
         logger.error(f"Job {job_id} failed: {e}", exc_info=True)
     finally:
         if os.path.exists(input_path):
@@ -313,16 +337,23 @@ def run_mastering_job(job_id: str, input_path: str, params: dict):
 
 def run_reference_job(job_id: str, input_path: str, reference_path: str, params: dict):
     jobs.update_job(job_id, status="processing", started_at=time.time(), progress=0, stage="Iniciando procesamiento")
+    jobs.set_stage(job_id, "analyzing", progress=10)
+    jobs.snapshot_params(job_id, params)
     try:
         cleanup_old()
+        jobs.append_log(job_id, "Procesando mastering con referencia", stage="rendering")
+        jobs.set_stage(job_id, "rendering", progress=25)
         result = process_audio_with_reference(
             input_path, reference_path, progress_cb=_make_progress_cb(job_id), **params
         )
+        output_path = result.get("output_path")
+        if output_path and os.path.exists(output_path):
+            jobs.add_export(job_id, "reference_master", output_path, version_name="reference_master", format=str(params.get("output_format", "wav")).lower())
         jobs.update_job(job_id, status="done", result=result, finished_at=time.time(),
                         progress=100, stage="Completado")
         logger.info(f"Job {job_id} (reference match) done: {result['output_path']}")
     except Exception as e:
-        jobs.update_job(job_id, status="error", error=str(e))
+        jobs.mark_failed(job_id, str(e), stage="failed", progress=0)
         logger.error(f"Job {job_id} (reference match) failed: {e}", exc_info=True)
     finally:
         if os.path.exists(input_path):
@@ -335,16 +366,23 @@ def run_normalize_job(job_id: str, input_path: str, params: dict):
     aplica una ganancia, sin EQ/dinámica/referencia. Mismo patrón que
     run_mastering_job/run_reference_job."""
     jobs.update_job(job_id, status="processing", started_at=time.time(), progress=0, stage="Iniciando normalización")
+    jobs.set_stage(job_id, "analyzing", progress=10)
+    jobs.snapshot_params(job_id, params)
     try:
         cleanup_old()
+        jobs.append_log(job_id, "Normalizando por LUFS", stage="rendering")
+        jobs.set_stage(job_id, "rendering", progress=25)
         result = normalize_by_lufs(
             input_path, progress_cb=_make_progress_cb(job_id), **params
         )
+        output_path = result.get("output_path")
+        if output_path and os.path.exists(output_path):
+            jobs.add_export(job_id, "lufs_normalized", output_path, version_name="lufs_normalized", format=str(params.get("output_format", "wav")).lower())
         jobs.update_job(job_id, status="done", result=result, finished_at=time.time(),
                         progress=100, stage="Completado")
         logger.info(f"Job {job_id} (lufs normalize) done: {result['output_path']}")
     except Exception as e:
-        jobs.update_job(job_id, status="error", error=str(e))
+        jobs.mark_failed(job_id, str(e), stage="failed", progress=0)
         logger.error(f"Job {job_id} (lufs normalize) failed: {e}", exc_info=True)
     finally:
         if os.path.exists(input_path):
@@ -453,6 +491,12 @@ app.include_router(create_dashboard_router(
 app.include_router(create_jobs_router(
     jobs=jobs,
     sanitize_track_name=sanitize_track_name,
+    processed_dir=PROCESSED_DIR,
+))
+app.include_router(create_projects_router(
+    jobs=jobs,
+    sanitize_track_name=sanitize_track_name,
+    processed_dir=PROCESSED_DIR,
 ))
 app.include_router(create_auth_router(logger=logger))
 app.include_router(create_analysis_router(
@@ -1652,9 +1696,22 @@ async def master_async(
     job_params = dict(params)
     if duration is not None:
         job_params["_input_duration_sec"] = duration
-    jobs.create_job(job_id, {"status": "queued", "filename": filename, "created_at": time.time(), "params": job_params, "progress": 0, "stage": "En cola"})
+    
+    # Create project + version for this mastering job
+    project_name = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    project_id = f"proj_{job_id}"
+    jobs.create_project(project_id, {
+        "title": project_name,
+        "artist": "Unknown",
+        "status": "active",
+        "job_type": "mastering",
+    })
+    # Create initial version with job reference
+    jobs.add_version(project_id, "master_v1", job_id=job_id, preset_snapshot=job_params)
+    
+    jobs.create_job(job_id, {"status": "queued", "filename": filename, "created_at": time.time(), "params": job_params, "progress": 0, "stage": "En cola", "project_id": project_id})
     background_tasks.add_task(run_mastering_job, job_id, input_path, params)
-    return {"job_id": job_id, "status": "queued", "poll_url": f"/job/{job_id}"}
+    return {"job_id": job_id, "project_id": project_id, "status": "queued", "poll_url": f"/job/{job_id}", "project_url": f"/projects/{project_id}"}
 
 # ── Master sync ──────────────────────────────────────────────────────────────
 @app.post("/master/sync", tags=["Mastering"])
@@ -2120,9 +2177,21 @@ async def master_with_reference(
     job_params = dict(params, reference_filename=reference_filename)
     if duration is not None:
         job_params["_input_duration_sec"] = duration
-    jobs.create_job(job_id, {"status": "queued", "filename": filename, "created_at": time.time(), "params": job_params, "progress": 0, "stage": "En cola"})
+    
+    # Create project + version for this reference mastering job
+    project_name = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    project_id = f"proj_{job_id}"
+    jobs.create_project(project_id, {
+        "title": project_name,
+        "artist": "Unknown",
+        "status": "active",
+        "job_type": "reference_mastering",
+    })
+    jobs.add_version(project_id, "reference_v1", job_id=job_id, preset_snapshot=job_params)
+    
+    jobs.create_job(job_id, {"status": "queued", "filename": filename, "created_at": time.time(), "params": job_params, "progress": 0, "stage": "En cola", "project_id": project_id})
     background_tasks.add_task(run_reference_job, job_id, input_path, reference_path, params)
-    return {"job_id": job_id, "status": "queued", "poll_url": f"/job/{job_id}"}
+    return {"job_id": job_id, "project_id": project_id, "status": "queued", "poll_url": f"/job/{job_id}", "project_url": f"/projects/{project_id}"}
 
 @app.post("/master/reference/sync", tags=["Mastering"])
 async def master_with_reference_sync(
@@ -2235,9 +2304,21 @@ async def master_normalize(
     job_params = dict(params)
     if duration is not None:
         job_params["_input_duration_sec"] = duration
-    jobs.create_job(job_id, {"status": "queued", "filename": filename, "created_at": time.time(), "params": job_params, "progress": 0, "stage": "En cola"})
+    
+    # Create project + version for this normalize job
+    project_name = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    project_id = f"proj_{job_id}"
+    jobs.create_project(project_id, {
+        "title": project_name,
+        "artist": "Unknown",
+        "status": "active",
+        "job_type": "normalize",
+    })
+    jobs.add_version(project_id, "normalized", job_id=job_id, preset_snapshot=job_params)
+    
+    jobs.create_job(job_id, {"status": "queued", "filename": filename, "created_at": time.time(), "params": job_params, "progress": 0, "stage": "En cola", "project_id": project_id})
     background_tasks.add_task(run_normalize_job, job_id, input_path, params)
-    return {"job_id": job_id, "status": "queued", "poll_url": f"/job/{job_id}"}
+    return {"job_id": job_id, "project_id": project_id, "status": "queued", "poll_url": f"/job/{job_id}", "project_url": f"/projects/{project_id}"}
 
 @app.post("/master/normalize/sync", tags=["Mastering"])
 async def master_normalize_sync(

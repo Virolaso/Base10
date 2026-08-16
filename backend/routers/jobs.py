@@ -4,8 +4,15 @@ import html
 import os
 from typing import Optional
 
+import numpy as np
+import soundfile as sf
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+try:
+    from pydub import AudioSegment
+except ImportError:  # pragma: no cover - fallback si no está instalado
+    AudioSegment = None
 
 
 PLATFORM_TARGETS = {
@@ -179,8 +186,60 @@ def _render_visual_report(report: dict) -> str:
     <div class="card wide"><h2>Checklist de entrega</h2><ul class="checklist">{checklist}</ul></div><div class="card wide"><h2>Cambios principales aplicados</h2><ul>{changes_html}</ul></div><div class="card wide">{_spectrum_svg(before.get('spectrum', {}), after.get('spectrum', {}))}</div><div class="card wide"><h2>Tonal balance final</h2><div class="tonal">{_tonal_balance_rows(after.get('spectrum', {}))}</div></div><div class="card wide"><h2>Issues</h2><ul>{issues_html}</ul></div><div class="card wide"><h2>Recomendaciones</h2><ul>{tips_html}</ul></div></section></main></article><button class="print" onclick="window.print()">Imprimir / guardar PDF</button></body></html>'''
 
 
-def create_jobs_router(*, jobs, sanitize_track_name) -> APIRouter:
+def create_jobs_router(*, jobs, sanitize_track_name, processed_dir: Optional[str] = None) -> APIRouter:
     router = APIRouter()
+    processed_dir = processed_dir or os.path.join(os.getcwd(), "processed")
+
+    def _ensure_export_dir() -> str:
+        os.makedirs(processed_dir, exist_ok=True)
+        return processed_dir
+
+    def _render_preview_from_file(input_path: str, preview_path: str, preview_seconds: int = 15) -> None:
+        audio, sr = sf.read(input_path, always_2d=False)
+        if audio.size == 0:
+            raise ValueError("No se pudo leer el archivo de salida para generar preview.")
+        if audio.ndim == 1:
+            audio = audio[np.newaxis, :]
+        samples = int(sr * max(1, preview_seconds))
+        total = audio.shape[1]
+        start = max(0, total // 2 - samples // 2)
+        end = min(total, start + samples)
+        chunk = audio[:, start:end]
+        if chunk.shape[1] < samples:
+            pad = np.zeros((chunk.shape[0], samples - chunk.shape[1]), dtype=chunk.dtype)
+            chunk = np.concatenate([chunk, pad], axis=1)
+        sf.write(preview_path, chunk.T if chunk.ndim == 2 and chunk.shape[0] == 2 else chunk.T if chunk.ndim == 2 else chunk, sr, subtype="PCM_24")
+
+    def _export_audio_variant(input_path: str, out_path: str, fmt: str, bitrate: Optional[str] = None) -> None:
+        fmt = fmt.lower()
+        if fmt in {"wav", "aiff", "flac"}:
+            audio, sr = sf.read(input_path, always_2d=False)
+            if fmt == "wav":
+                sf.write(out_path, audio, sr, subtype="PCM_24")
+            elif fmt == "aiff":
+                sf.write(out_path, audio, sr, format="AIFF", subtype="PCM_16")
+            elif fmt == "flac":
+                sf.write(out_path, audio, sr, format="FLAC")
+            return
+
+        if fmt in {"mp3", "aac"} and AudioSegment is not None:
+            audio, sr = sf.read(input_path, always_2d=False)
+            if audio.ndim == 2:
+                audio = np.asfortranarray(audio.T)
+            pcm = np.asarray(audio, dtype=np.float32)
+            if pcm.ndim == 1:
+                pcm = pcm[:, np.newaxis]
+            wav_tmp = out_path + ".tmp.wav"
+            sf.write(wav_tmp, pcm, sr, subtype="PCM_24")
+            try:
+                seg = AudioSegment.from_wav(wav_tmp)
+                seg.export(out_path, format=fmt, bitrate=bitrate or ("320k" if fmt == "mp3" else "256k"))
+            finally:
+                if os.path.exists(wav_tmp):
+                    os.remove(wav_tmp)
+            return
+
+        raise HTTPException(400, f"Formato de exportación no soportado: {fmt}")
 
     def _done_job_or_404(job_id: str) -> dict:
         if not jobs.exists(job_id):
@@ -249,8 +308,78 @@ def create_jobs_router(*, jobs, sanitize_track_name) -> APIRouter:
     @router.get("/jobs", tags=["Jobs"])
     def list_jobs():
         return [
-            {"job_id": k, "status": v["status"], "filename": v["filename"], "created_at": v["created_at"]}
+            {"job_id": k, "status": v["status"], "filename": v["filename"], "created_at": v["created_at"], "stage": v.get("stage"), "progress": v.get("progress")}
             for k, v in jobs.get_all().items()
         ]
+
+    @router.get("/jobs/{job_id}", tags=["Jobs"])
+    def get_job_detail(job_id: str):
+        if not jobs.exists(job_id):
+            raise HTTPException(404, "Job no encontrado")
+        return jobs.get_job(job_id)
+
+    @router.post("/jobs/{job_id}/preview", tags=["Jobs"])
+    def register_preview(job_id: str, preview_path: str, duration_seconds: Optional[float] = None, format: str = "wav"):
+        if not jobs.exists(job_id):
+            raise HTTPException(404, "Job no encontrado")
+        return jobs.set_preview(job_id, preview_path, duration_seconds=duration_seconds, format=format)
+
+    @router.post("/jobs/{job_id}/preview/generate", tags=["Jobs"])
+    def generate_preview(job_id: str, preview_seconds: int = 15, format: str = "wav"):
+        job = _done_job_or_404(job_id)
+        output_path = job.get("result", {}).get("output_path")
+        if not output_path or not os.path.exists(output_path):
+            raise HTTPException(410, "No hay master final disponible para generar preview.")
+        export_root = _ensure_export_dir()
+        preview_name = f"{job_id}_preview_{preview_seconds}s.{format.lower()}"
+        preview_path = os.path.join(export_root, preview_name)
+        if format.lower() == "wav":
+            _render_preview_from_file(output_path, preview_path, preview_seconds=preview_seconds)
+        else:
+            wav_preview = os.path.join(export_root, f"{job_id}_preview_{preview_seconds}s_tmp.wav")
+            _render_preview_from_file(output_path, wav_preview, preview_seconds=preview_seconds)
+            _export_audio_variant(wav_preview, preview_path, format.lower(), bitrate="256k")
+            if os.path.exists(wav_preview):
+                os.remove(wav_preview)
+        jobs.set_preview(job_id, preview_path, duration_seconds=float(preview_seconds), format=format.lower())
+        return jobs.get_job(job_id)
+
+    @router.post("/jobs/{job_id}/export", tags=["Jobs"])
+    def register_export(job_id: str, export_id: str, export_path: str, version_name: Optional[str] = None, format: Optional[str] = None, **extra):
+        if not jobs.exists(job_id):
+            raise HTTPException(404, "Job no encontrado")
+        return jobs.add_export(job_id, export_id, export_path, version_name=version_name, format=format, **extra)
+
+    @router.post("/jobs/{job_id}/exports/generate", tags=["Jobs"])
+    def generate_exports(job_id: str, formats: str = "wav,mp3,aiff", bitrates: str = "320k,256k,256k", version_name: Optional[str] = None):
+        job = _done_job_or_404(job_id)
+        source_path = job.get("result", {}).get("output_path")
+        if not source_path or not os.path.exists(source_path):
+            raise HTTPException(410, "No hay master final existente para exportar.")
+
+        requested = [fmt.strip().lower() for fmt in formats.split(",") if fmt.strip()]
+        bitrate_values = [bit.strip() for bit in bitrates.split(",") if bit.strip()]
+        export_root = _ensure_export_dir()
+        created = []
+
+        for index, fmt in enumerate(requested):
+            if fmt not in {"wav", "mp3", "aac", "aiff", "flac"}:
+                continue
+            bitrate = bitrate_values[index] if index < len(bitrate_values) else None
+            out_name = f"{job_id}_{version_name or 'version'}_{fmt}.{fmt}"
+            out_path = os.path.join(export_root, out_name)
+            _export_audio_variant(source_path, out_path, fmt, bitrate=bitrate)
+            export_id = f"{fmt}_{index + 1}"
+            version_name_value = version_name or f"{fmt}_export_{index + 1}"
+            jobs.add_export(job_id, export_id, out_path, version_name=version_name_value, format=fmt, bitrate=bitrate)
+            created.append({"export_id": export_id, "format": fmt, "path": out_path, "version_name": version_name_value})
+
+        return {"job_id": job_id, "exports": created}
+
+    @router.post("/jobs/{job_id}/archive", tags=["Jobs"])
+    def archive_job(job_id: str, reason: Optional[str] = None):
+        if not jobs.exists(job_id):
+            raise HTTPException(404, "Job no encontrado")
+        return jobs.archive(job_id, reason=reason)
 
     return router
